@@ -21,11 +21,14 @@ use std::io::net::ip::{SocketAddr};
 use std::{os, str, libc, from_str};
 use std::path::Path;
 use std::hashmap::HashMap;
+use std::num::ToPrimitive;
 
 use extra::getopts;
 use extra::arc::MutexArc;
 use extra::arc::RWArc;
 use gash::*;
+use extra::lru_cache::LruCache;
+
 mod gash;
 
 static SERVER_NAME : &'static str = "Zhtta Version 0.5";
@@ -66,8 +69,11 @@ struct WebServer {
     
     notify_port: Port<()>,
     shared_notify_chan: SharedChan<()>,
+//added
     visitor_count : RWArc<int>,
     task_count : RWArc<int>,
+ 	cache_map_arc: MutexArc<LruCache<~str, ~[u8]>>,
+ 	cache: LruCache<~str, ~[u8]>,
 }
 
 impl WebServer {
@@ -88,7 +94,9 @@ impl WebServer {
             shared_notify_chan: shared_notify_chan,      
 //Added 
             visitor_count : RWArc::new(0),
-            task_count: RWArc::new(12),
+            task_count: RWArc::new(16),
+            cache_map_arc: MutexArc::new(LruCache::new(4)),
+ 		    cache: LruCache::new(4),
         }
     }
     
@@ -199,7 +207,7 @@ impl WebServer {
         stream.write(response.as_bytes());
     }
     
-    // TODO: Streaming file.
+    // Done: Streaming file.
 //added get file size
     fn get_size(path: &Path) -> uint{
     	let fsize = path.stat();
@@ -207,27 +215,62 @@ impl WebServer {
     }
     
     // Done: Application-layer file caching.
-    fn respond_with_static_file(stream: Option<std::io::net::tcp::TcpStream>, path: &Path) {
+
+    fn respond_with_static_file(stream: Option<std::io::net::tcp::TcpStream>, path: &Path, cache: MutexArc<LruCache<~str, ~[u8]>>) {
+// added steaming method & caching
         let mut stream = stream;
-        let mut file_reader = File::open(path).expect("Invalid file!");
+        //let mut file_reader = File::open(path).expect("Invalid file!").to_owned();
         stream.write(HTTP_OK.as_bytes());
-		let file_size: uint = WebServer::get_size(path);
-// added steaming method  		
+		//let file_size: uint = WebServer::get_size(path);	
+		let path_name: ~str = path.as_str().expect("Invalid file.").to_owned();
+
  		let mut already_read: uint = 0;
  		let block_size: uint = 10240;
- 		while block_size < (file_size - already_read) {
- 			stream.write(file_reader.read_bytes(block_size));
- 			already_read += block_size;
- 		}
-        stream.write(file_reader.read_to_end());
- 	}
+ 		       
+		cache.access( |cache_map| {
+ 			let mut buffer: ~[u8] = ~[];
+        	match cache_map.get(&path_name) {
+        	 	None => {
+ 					let mut file_reader = File::open(path).expect("Invalid file!");
+ 					let file_size: uint = WebServer::get_size(path);
+ 					
+ 					while block_size < (file_size - already_read) {
+ 						let block = file_reader.read_bytes(block_size);
+ 						stream.write(block);
+ 						already_read += block_size;
+ 						buffer.push_all_move(block);
+ 					}//while
+ 					let block = file_reader.read_to_end();
+         			stream.write(block);
+ 					buffer.push_all_move(block);
+ 				}//None
+ 				
+ 				Some(buff) => {
+ 					let file_size: uint = buff.len();
+ 			
+ 					while block_size < (file_size - already_read) {
+ 						let block = buff.slice(already_read, already_read + block_size);
+ 						stream.write(block);
+ 						already_read += block_size;
+ 					}//while
+    				stream.write(buff.slice(already_read, file_size));
+				}//Some
+		 	}//match
+	 		if buffer.len() > 0 {
+ 				cache_map.put(path_name.clone(), buffer);
+ 			}//if
+ 			
+    	}); //cache
+               
+ 	}//fn respond with static file
  	
 //added
 	fn respond_with_dynamic_file(stream: Option<std::io::net::tcp::TcpStream>, path: &Path) {
  		let mut stream = stream;
         let mut file_reader = File::open(path).expect("Invalid file!");
+		let file_bytes = file_reader.read_to_end();
         stream.write(HTTP_OK.as_bytes());
- 		let file_bytes = file_reader.read_to_end();
+
 //dynamic_file
 
  		let file_string = str::from_utf8(file_bytes);
@@ -281,14 +324,23 @@ impl WebServer {
 //check ip address, split by dot and then check first two values of ip. if satisfy then prioritize
 //s			println!("{:?}", WebServer::get_size(path_obj)); 			
  			let peer_value = peer_name.split('.').to_owned_vec();
- 			let first_two = peer_value[0] + "." + peer_value[1];
- 			if (str::eq(&first_two, &~"128.143") || str::eq(&first_two, &~"137.54")) {
+ 			let ip_vec = peer_value[0] + "." + peer_value[1];
+ 			
+ 			if (str::eq(&ip_vec, &~"128.143")) {
+ 				local_req_queue.unshift(req);
+ 			}
+ 			else if (str::eq(&ip_vec, &~"137.54")){
+ 				local_req_queue.unshift(req); 				
+ 			}
+ 			else if (str::eq(&ip_vec, &~"71.206")){
+ 				local_req_queue.unshift(req); 				
+ 			}
+ 			else if (str::eq(&ip_vec, &~"127.143")){
  				local_req_queue.unshift(req);
  			}
 			else {
  				local_req_queue.push(req);
-	 		}	
-	 		
+	 		}		 		
             debug!("A new request enqueued, now the length of queue is {:u}.", local_req_queue.len());
         });
         
@@ -303,6 +355,7 @@ impl WebServer {
         let stream_map_get = self.stream_map_arc.clone();
 //added
 		let get_task_count = self.task_count.clone();
+		let cache_map_get = self.cache_map_arc.clone();
         // Port<> cannot be sent to another task. So we have to make this task as the main task that can access self.notify_port.
         
         let (request_port, request_chan) = Chan::new();
@@ -336,17 +389,19 @@ impl WebServer {
             //let stream = stream_port.recv();
             //WebServer::respond_with_static_file(stream, request.path);
             //debug!("=====Terminated connection from [{:s}].=====", request.peer_name);
+
 //added tasks            
-            let mut temp = 0;
-            get_task_count.read(|count| {temp = *count;});
-			if (temp > 0){
+            let mut temp_task = 0;
+            get_task_count.read(|count| {temp_task = *count;});
+			if (temp_task > 0){
 				let task_count_clone = get_task_count.clone();
+				let cache_map_clone = cache_map_get.clone();
 				spawn(proc(){
 					//println!("{:?}", *count);}
 					task_count_clone.write(|count| {*count -= 1;});
 
 					let stream = stream_port.recv();	
-		 			WebServer::respond_with_static_file(stream, request.path);
+		 			WebServer::respond_with_static_file(stream, request.path, cache_map_clone);
 
 		 			// Close stream automatically.
 	 		        debug!("=====Terminated connection from [{:s}].=====", request.peer_name);
