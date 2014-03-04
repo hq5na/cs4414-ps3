@@ -6,4 +6,8 @@
 <body>
 <h1>Greetings, Krusty!</h1>
 <h2>Date: <!--#exec cmd="date" --></h2>
+<p>Below is dynamic cmd:</p>
+<p><!--#exec cmd="date" --></p>
+<p><!--#exec cmd="ls" --></p>
+
 </body></html>
