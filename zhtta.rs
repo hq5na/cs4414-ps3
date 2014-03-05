@@ -28,6 +28,7 @@ use extra::arc::MutexArc;
 use extra::arc::RWArc;
 use gash::*;
 use extra::lru_cache::LruCache;
+use extra::sync::Semaphore;
 
 mod gash;
 
@@ -36,6 +37,7 @@ static SERVER_NAME : &'static str = "Zhtta Version 0.5";
 static IP : &'static str = "127.0.0.1";
 static PORT : uint = 4414;
 static WWW_DIR : &'static str = "./www";
+static TASKS : int = 128;
 
 static HTTP_OK : &'static str = "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=UTF-8\r\n\r\n";
 static HTTP_BAD : &'static str = "HTTP/1.1 404 Not Found\r\n\r\n";
@@ -57,6 +59,7 @@ struct HTTP_Request {
     //  See issue: https://github.com/mozilla/rust/issues/12139)
     peer_name: ~str,
     path: ~Path,
+    file_size: uint,
 }
 
 struct WebServer {
@@ -74,10 +77,11 @@ struct WebServer {
     task_count : RWArc<int>,
  	cache_map_arc: MutexArc<LruCache<~str, ~[u8]>>,
  	cache: LruCache<~str, ~[u8]>,
+ 	req_handling_tasks: Semaphore,
 }
 
 impl WebServer {
-    fn new(ip: &str, port: uint, www_dir: &str) -> WebServer {
+    fn new(ip: &str, port: uint, www_dir: &str, tasks: int) -> WebServer {
         let (notify_port, shared_notify_chan) = SharedChan::new();
         let www_dir_path = ~Path::new(www_dir);
         os::change_dir(www_dir_path.clone());
@@ -94,9 +98,10 @@ impl WebServer {
             shared_notify_chan: shared_notify_chan,      
 //Added 
             visitor_count : RWArc::new(0),
-            task_count: RWArc::new(16),
+            task_count: RWArc::new(8),
             cache_map_arc: MutexArc::new(LruCache::new(4)),
  		    cache: LruCache::new(4),
+ 		    req_handling_tasks: Semaphore::new(tasks),
         }
     }
     
@@ -112,9 +117,9 @@ impl WebServer {
         let request_queue_arc = self.request_queue_arc.clone();
         let shared_notify_chan = self.shared_notify_chan.clone();
         let stream_map_arc = self.stream_map_arc.clone();
-        
 //added
 		let visitor_count_clone = self.visitor_count.clone();
+		let cache_map_arc_clone = self.cache_map_arc.clone();
                 
         spawn(proc() {
             let mut acceptor = net::tcp::TcpListener::bind(addr).listen();
@@ -126,16 +131,18 @@ impl WebServer {
                 queue_chan.send(request_queue_arc.clone());
                 
                 let notify_chan = shared_notify_chan.clone();
-                let stream_map_arc = stream_map_arc.clone();
-                
+                let stream_map_arc = stream_map_arc.clone();                
 //added
 				let visitor_count_clone = visitor_count_clone.clone();
+				let cache_map_arc_clone = cache_map_arc_clone.clone();
                 // Spawn a task to handle the connection.
                 spawn(proc() {
 //                  unsafe { visitor_count += 1; } // TODO: Fix unsafe counter
+//added				
+					let cache_map_arc_clone = cache_map_arc_clone.clone();
                     visitor_count_clone.write(|current| {*current +=1});
                     let request_queue_arc = queue_port.recv();
-                  
+                  	
                     let mut stream = stream;
                     
                     let peer_name = WebServer::get_peer_name(&mut stream);
@@ -175,7 +182,13 @@ impl WebServer {
                             debug!("=====Terminated connection from [{:s}].=====", peer_name);
                         } else { 
                             debug!("===== Static Page request =====");
-                            WebServer::enqueue_static_file_request(stream, path_obj, stream_map_arc, request_queue_arc, notify_chan);
+                            if WebServer::get_size(path_obj) <= 512 {
+ 								let cache_map_arc_clone2 = cache_map_arc_clone.clone();
+ 								WebServer::respond_with_static_file(stream, path_obj, cache_map_arc_clone2);
+ 						    }
+ 						    else {
+ 								WebServer::enqueue_static_file_request(stream, path_obj, stream_map_arc, request_queue_arc, notify_chan);
+ 						    }
                         }
                     }
                 });
@@ -201,7 +214,6 @@ impl WebServer {
             format!("{:s}{:s}<h1>Greetings, Krusty!</h1>
                      <h2>Visitor count: {:?}</h2></body></html>\r\n", 
                     HTTP_OK, COUNTER_STYLE, 
-//                    unsafe { visitor_count } );
 					temp);
         debug!("Responding to counter request");
         stream.write(response.as_bytes());
@@ -225,7 +237,7 @@ impl WebServer {
 		let path_name: ~str = path.as_str().expect("Invalid file.").to_owned();
 
  		let mut already_read: uint = 0;
- 		let block_size: uint = 10240;
+ 		let block_size: uint = 12800;
  		       
 		cache.access( |cache_map| {
  			let mut buffer: ~[u8] = ~[];
@@ -233,27 +245,27 @@ impl WebServer {
         	 	None => {
  					let mut file_reader = File::open(path).expect("Invalid file!");
  					let file_size: uint = WebServer::get_size(path);
- 					
+ 	
  					while block_size < (file_size - already_read) {
- 						let block = file_reader.read_bytes(block_size);
- 						stream.write(block);
- 						already_read += block_size;
- 						buffer.push_all_move(block);
+ 					let block = file_reader.read_bytes(block_size);
+ 					stream.write(block);
+ 					already_read += block_size;
+ 					buffer.push_all_move(block);
  					}//while
  					let block = file_reader.read_to_end();
          			stream.write(block);
  					buffer.push_all_move(block);
  				}//None
  				
- 				Some(buff) => {
- 					let file_size: uint = buff.len();
+ 				Some(value) => {
+ 					let file_size: uint = value.len();
  			
  					while block_size < (file_size - already_read) {
- 						let block = buff.slice(already_read, already_read + block_size);
- 						stream.write(block);
- 						already_read += block_size;
+ 					let this_block = value.slice(already_read, already_read + block_size);
+ 					stream.write(this_block);
+ 					already_read += block_size;
  					}//while
-    				stream.write(buff.slice(already_read, file_size));
+    				stream.write(value.slice(already_read, file_size));
 				}//Some
 		 	}//match
 	 		if buffer.len() > 0 {
@@ -270,18 +282,16 @@ impl WebServer {
         let mut file_reader = File::open(path).expect("Invalid file!");
 		let file_bytes = file_reader.read_to_end();
         stream.write(HTTP_OK.as_bytes());
-
 //dynamic_file
-
  		let file_string = str::from_utf8(file_bytes);
  		let mut stream_output = file_string.to_owned(); 		
  		for line in file_string.lines() { //read
  			if line.contains("<!--#") {
- 				let read_line = line.slice(line.find_str("<!--#").unwrap(), line.find_str("-->").unwrap()+3);
+ 			let read_line = line.slice(line.find_str("<!--#").unwrap(), line.find_str("-->").unwrap()+3);
  				if (read_line.contains("#exec cmd=")) {
- 					let command = read_line.slice(read_line.find('"').unwrap()+1, read_line.rfind('"').unwrap()); //get cmd from input
- 					let output = gash::run_cmdline(command);
- 					stream_output = stream_output.replace(read_line, output); //replace output
+ 				let cmd = read_line.slice(read_line.find('"').unwrap()+1, read_line.rfind('"').unwrap()); //get cmd from input
+ 				let opt = gash::run_cmdline(cmd);
+ 				stream_output = stream_output.replace(read_line, opt); //replace output
  				}//if
  			}//if
  		}//for
@@ -290,12 +300,20 @@ impl WebServer {
     
     // Done: Server-side gashing.
     fn respond_with_dynamic_page(stream: Option<std::io::net::tcp::TcpStream>, path: &Path) {
-          // for now, just serve as static file
- //        WebServer::respond_with_static_file(stream, path);
        WebServer::respond_with_dynamic_file(stream, path); //changed to dynamic
     }
     
     // TODO: Smarter Scheduling.
+    fn get_index(vec: &mut ~[HTTP_Request], fsize: uint) -> uint {
+	 		let length: uint = vec.len();
+	 		if length == 0 { return 0;}
+	 		else {	for x in range(0, vec.len()) {
+ 				if(vec[x].file_size > fsize) {
+ 					return x;}}
+ 			}
+ 			return length;
+ 	}
+ 	    
     fn enqueue_static_file_request(stream: Option<std::io::net::tcp::TcpStream>, path_obj: &Path, stream_map_arc: MutexArc<HashMap<~str, Option<std::io::net::tcp::TcpStream>>>, req_queue_arc: MutexArc<~[HTTP_Request]>, notify_chan: SharedChan<()>) {
         // Save stream in hashmap for later response.
         let mut stream = stream;
@@ -311,42 +329,32 @@ impl WebServer {
         }
         
         // Enqueue the HTTP request.
-        let req = HTTP_Request { peer_name: peer_name.clone(), path: ~path_obj.clone() };
+        let req = HTTP_Request { peer_name: peer_name.clone(), path: ~path_obj.clone(), file_size: WebServer::get_size(&path_obj.clone()) };
         let (req_port, req_chan) = Chan::new();
         req_chan.send(req);
-
+     
         debug!("Waiting for queue mutex lock.");
         req_queue_arc.access(|local_req_queue| {
             debug!("Got queue mutex lock.");
-            let req: HTTP_Request = req_port.recv();
-//            local_req_queue.push(req);
-//added
-//check ip address, split by dot and then check first two values of ip. if satisfy then prioritize
-//s			println!("{:?}", WebServer::get_size(path_obj)); 			
- 			let peer_value = peer_name.split('.').to_owned_vec();
+            let mut req: HTTP_Request = req_port.recv();
+//added priority
+			let peer_value = peer_name.split('.').to_owned_vec();
  			let ip_vec = peer_value[0] + "." + peer_value[1];
- 			
- 			if (str::eq(&ip_vec, &~"128.143")) {
- 				local_req_queue.unshift(req);
+ 			if !(str::eq(&ip_vec, &~"128.143")) {
+ 				req = HTTP_Request {peer_name: req.peer_name.clone(), path: req.path.clone(), file_size: req.file_size.clone()*2};
  			}
- 			else if (str::eq(&ip_vec, &~"137.54")){
- 				local_req_queue.unshift(req); 				
+ 			else if !(str::eq(&ip_vec, &~"137.54")){
+ 				req = HTTP_Request {peer_name: req.peer_name.clone(), path: req.path.clone(), file_size: req.file_size.clone()*2}; 				
  			}
  			else if (str::eq(&ip_vec, &~"71.206")){
- 				local_req_queue.unshift(req); 				
+ 				req = HTTP_Request {peer_name: req.peer_name.clone(), path: req.path.clone(), file_size: req.file_size.clone()*2}; 				
  			}
- 			else if (str::eq(&ip_vec, &~"127.143")){
- 				local_req_queue.unshift(req);
- 			}
-			else {
- 				local_req_queue.push(req);
-	 		}		 		
+			let position = WebServer::get_index(local_req_queue, req.file_size.clone());
+			local_req_queue.insert(position, req);		 		
             debug!("A new request enqueued, now the length of queue is {:u}.", local_req_queue.len());
         });
         
         notify_chan.send(()); // Send incoming notification to responder task.
-    
-    
     }
     
     // TODO: Smarter Scheduling.
@@ -354,7 +362,6 @@ impl WebServer {
         let req_queue_get = self.request_queue_arc.clone();
         let stream_map_get = self.stream_map_arc.clone();
 //added
-		let get_task_count = self.task_count.clone();
 		let cache_map_get = self.cache_map_arc.clone();
         // Port<> cannot be sent to another task. So we have to make this task as the main task that can access self.notify_port.
         
@@ -387,27 +394,26 @@ impl WebServer {
             // TODO: Spawning more tasks to respond the dequeued requests concurrently. You may need a semophore to control the concurrency.
 			//original code
             //let stream = stream_port.recv();
-            //WebServer::respond_with_static_file(stream, request.path);
+            //let cache_map_clone = cache_map_get.clone();
+            //WebServer::respond_with_static_file(stream, request.path, cache_map_clone);
             //debug!("=====Terminated connection from [{:s}].=====", request.peer_name);
 
 //added tasks            
-            let mut temp_task = 0;
-            get_task_count.read(|count| {temp_task = *count;});
-			if (temp_task > 0){
-				let task_count_clone = get_task_count.clone();
-				let cache_map_clone = cache_map_get.clone();
-				spawn(proc(){
-					//println!("{:?}", *count);}
-					task_count_clone.write(|count| {*count -= 1;});
-
-					let stream = stream_port.recv();	
-		 			WebServer::respond_with_static_file(stream, request.path, cache_map_clone);
-
-		 			// Close stream automatically.
-	 		        debug!("=====Terminated connection from [{:s}].=====", request.peer_name);
-		 			task_count_clone.write(|count| {*count += 1;});
-				});
-			}           
+            self.req_handling_tasks.acquire();
+            let (semaphore_port, semaphore_chan) = Chan::new();            
+            let cache_map_clone = cache_map_get.clone();
+            semaphore_chan.send(self.req_handling_tasks.clone());
+            spawn(proc() {
+                let req_tasks = semaphore_port.recv();
+                req_tasks.access(|| {        
+                    let stream = stream_port.recv();
+                    let cache_map_2 = cache_map_clone.clone();
+                	//let cached_map = cached_port.recv();
+                    WebServer::respond_with_static_file(stream, request.path, cache_map_2);
+                });
+                req_tasks.release();
+                debug!("=====Terminated connection from [{:s}].=====", request.peer_name);
+            });
         }
     }
     
@@ -424,12 +430,13 @@ impl WebServer {
     }
 }
 
-fn get_args() -> (~str, uint, ~str) {
+fn get_args() -> (~str, uint, ~str, int) {
     fn print_usage(program: &str) {
         println!("Usage: {:s} [options]", program);
         println!("--ip     \tIP address, \"{:s}\" by default.", IP);
         println!("--port   \tport number, \"{:u}\" by default.", PORT);
         println!("--www    \tworking directory, \"{:s}\" by default", WWW_DIR);
+        println!("--task   \tnumber of tasks for handling requests, \"{:d}\" by default.", TASKS);
         println("-h --help \tUsage");
     }
     
@@ -441,6 +448,7 @@ fn get_args() -> (~str, uint, ~str) {
         getopts::optopt("ip"),
         getopts::optopt("port"),
         getopts::optopt("www"),
+        getopts::optopt("task"),
         getopts::optflag("h"),
         getopts::optflag("help")
     ];
@@ -470,12 +478,17 @@ fn get_args() -> (~str, uint, ~str) {
     let www_dir_str = if matches.opt_present("www") {
                         matches.opt_str("www").expect("invalid www argument?") 
                       } else { WWW_DIR.to_owned() };
-    
-    (ip_str, port, www_dir_str)
+	
+	let tasks:int = if matches.opt_present("task") {
+                         from_str::from_str(matches.opt_str("task").expect("invalid task number?")).expect("not uint?")
+                     } else {
+                        TASKS
+                     };    
+    (ip_str, port, www_dir_str, tasks)
 }
 
 fn main() {
-    let (ip_str, port, www_dir_str) = get_args();
-    let mut zhtta = WebServer::new(ip_str, port, www_dir_str);
+    let (ip_str, port, www_dir_str, tasks) = get_args();
+    let mut zhtta = WebServer::new(ip_str, port, www_dir_str, tasks);
     zhtta.run();
 }
