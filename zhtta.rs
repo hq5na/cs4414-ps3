@@ -37,7 +37,8 @@ static SERVER_NAME : &'static str = "Zhtta Version 0.5";
 static IP : &'static str = "127.0.0.1";
 static PORT : uint = 4414;
 static WWW_DIR : &'static str = "./www";
-static TASKS : int = 128;
+static TASKS : int = 256;
+static CACHE : uint = 8;
 
 static HTTP_OK : &'static str = "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=UTF-8\r\n\r\n";
 static HTTP_BAD : &'static str = "HTTP/1.1 404 Not Found\r\n\r\n";
@@ -74,14 +75,13 @@ struct WebServer {
     shared_notify_chan: SharedChan<()>,
 //added
     visitor_count : RWArc<int>,
-    task_count : RWArc<int>,
  	cache_map_arc: MutexArc<LruCache<~str, ~[u8]>>,
  	cache: LruCache<~str, ~[u8]>,
  	req_handling_tasks: Semaphore,
 }
 
 impl WebServer {
-    fn new(ip: &str, port: uint, www_dir: &str, tasks: int) -> WebServer {
+    fn new(ip: &str, port: uint, www_dir: &str, tasks: int, cache: uint) -> WebServer {
         let (notify_port, shared_notify_chan) = SharedChan::new();
         let www_dir_path = ~Path::new(www_dir);
         os::change_dir(www_dir_path.clone());
@@ -98,9 +98,8 @@ impl WebServer {
             shared_notify_chan: shared_notify_chan,      
 //Added 
             visitor_count : RWArc::new(0),
-            task_count: RWArc::new(8),
-            cache_map_arc: MutexArc::new(LruCache::new(4)),
- 		    cache: LruCache::new(4),
+            cache_map_arc: MutexArc::new(LruCache::new(cache)),
+ 		    cache: LruCache::new(cache),
  		    req_handling_tasks: Semaphore::new(tasks),
         }
     }
@@ -392,12 +391,6 @@ impl WebServer {
             }
             
             // TODO: Spawning more tasks to respond the dequeued requests concurrently. You may need a semophore to control the concurrency.
-			//original code
-            //let stream = stream_port.recv();
-            //let cache_map_clone = cache_map_get.clone();
-            //WebServer::respond_with_static_file(stream, request.path, cache_map_clone);
-            //debug!("=====Terminated connection from [{:s}].=====", request.peer_name);
-
 //added tasks            
             self.req_handling_tasks.acquire();
             let (semaphore_port, semaphore_chan) = Chan::new();            
@@ -430,13 +423,14 @@ impl WebServer {
     }
 }
 
-fn get_args() -> (~str, uint, ~str, int) {
+fn get_args() -> (~str, uint, ~str, int, uint) {
     fn print_usage(program: &str) {
         println!("Usage: {:s} [options]", program);
         println!("--ip     \tIP address, \"{:s}\" by default.", IP);
         println!("--port   \tport number, \"{:u}\" by default.", PORT);
         println!("--www    \tworking directory, \"{:s}\" by default", WWW_DIR);
         println!("--task   \tnumber of tasks for handling requests, \"{:d}\" by default.", TASKS);
+        println!("--cache  \tnumber of least recently used cache, \"{:u}\" by default.", CACHE);
         println("-h --help \tUsage");
     }
     
@@ -449,6 +443,7 @@ fn get_args() -> (~str, uint, ~str, int) {
         getopts::optopt("port"),
         getopts::optopt("www"),
         getopts::optopt("task"),
+        getopts::optopt("cache"),
         getopts::optflag("h"),
         getopts::optflag("help")
     ];
@@ -483,12 +478,17 @@ fn get_args() -> (~str, uint, ~str, int) {
                          from_str::from_str(matches.opt_str("task").expect("invalid task number?")).expect("not uint?")
                      } else {
                         TASKS
-                     };    
-    (ip_str, port, www_dir_str, tasks)
+                     };  
+    let cache:uint = if matches.opt_present("cache") {
+                         from_str::from_str(matches.opt_str("cache").expect("invalid cache number?")).expect("not int?")
+                     } else {
+                        CACHE
+                     };  
+    (ip_str, port, www_dir_str, tasks, cache)
 }
 
 fn main() {
-    let (ip_str, port, www_dir_str, tasks) = get_args();
-    let mut zhtta = WebServer::new(ip_str, port, www_dir_str, tasks);
+    let (ip_str, port, www_dir_str, tasks, cache) = get_args();
+    let mut zhtta = WebServer::new(ip_str, port, www_dir_str, tasks, cache);
     zhtta.run();
 }
